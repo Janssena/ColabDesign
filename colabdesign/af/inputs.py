@@ -23,9 +23,17 @@ class _af_inputs:
     # protocol specific modifications to seq features
     if self.protocol == "binder":
       # concatenate target and binder sequence
-      seq_target = jax.nn.one_hot(inputs["batch"]["aatype"][:self._target_len],self._args["alphabet_size"])
-      seq_target = jnp.broadcast_to(seq_target,(self._num, *seq_target.shape))
-      seq = jax.tree_util.tree_map(lambda x:jnp.concatenate([seq_target,x],1), seq)
+      if self._args.get("use_target_msa", False):
+        # use real target MSA (parsed from an a3m) instead of a single broadcast
+        # copy, so the target side keeps evolutionary/co-variation signal even
+        # when rm_target=True removes the structural template
+        seq_target = jax.nn.one_hot(inputs["batch"]["msa_aatype"], self._args["alphabet_size"])
+      else:
+        seq_target = jax.nn.one_hot(inputs["batch"]["aatype"][:self._target_len],self._args["alphabet_size"])
+        seq_target = jnp.broadcast_to(seq_target,(self._num, *seq_target.shape))
+      num_seq = seq_target.shape[0]
+      seq = jax.tree_util.tree_map(
+        lambda x:jnp.concatenate([seq_target, jnp.broadcast_to(x,(num_seq,*x.shape[1:]))],1), seq)
       
     if self.protocol in ["fixbb","hallucination","partial"] and self._args["copies"] > 1:
       seq = jax.tree_util.tree_map(lambda x:expand_copies(x, self._args["copies"], self._args["block_diag"]), seq)

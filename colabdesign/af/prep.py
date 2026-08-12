@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import re
 
-from colabdesign.af.alphafold.data import pipeline, prep_inputs
+from colabdesign.af.alphafold.data import pipeline, prep_inputs, parsers
 from colabdesign.af.alphafold.common import protein, residue_constants
 from colabdesign.af.alphafold.model.tf import shape_placeholders
 from colabdesign.af.alphafold.model import config
@@ -185,8 +185,9 @@ class _af_prep:
                    rm_binder_seq=True,
                    rm_binder_sc=True,
                    rm_template_ic=False,
-                                      
-                   hotspot=None, ignore_missing=True, **kwargs):
+
+                   hotspot=None, ignore_missing=True,
+                   target_msa=None, target_msa_mode="env", msa_depth=128, **kwargs):
     '''
     prep inputs for binder design
     ---------------------------------------------------
@@ -198,6 +199,22 @@ class _af_prep:
     -rm_[binder/target]_seq = remove sequence info from template
     -rm_[binder/target]_sc  = remove sidechain info from template
     -ignore_missing=True - skip positions that have missing density (no CA coordinate)
+    -target_msa = path (or raw string) to an a3m alignment for the target chain,
+                  or "auto" to fetch one automatically (single-chain target only)
+                  from the public ColabFold MMseqs2 API (needs internet access).
+                  When provided, the target side of the MSA feature is filled with
+                  real aligned sequences (up to msa_depth rows) instead of a single
+                  broadcast copy of the target sequence. This restores evolutionary/
+                  co-variation signal for the target when rm_target=True removes the
+                  template (i.e. template-free binder design against e.g. an antibody).
+                  A manually-provided a3m must be built from the exact resolved
+                  target sequence used here (see prep_msa/ignore_missing).
+                  NOTE: this is independent of num_seq (which sets how many
+                  *independent binder designs* are batched together, via
+                  mk_af_model(num_seq=...)) -- target_msa is only supported
+                  together with the default num_seq=1 (a single binder design).
+    -target_msa_mode = "env" or "all", passed to fetch_msa() when target_msa="auto"
+    -msa_depth = number of target_msa rows to use (default 128)
     ---------------------------------------------------
     '''
     redesign = binder_chain is not None
@@ -239,10 +256,36 @@ class _af_prep:
       self._pdb["batch"] = make_fixed_size(self._pdb["batch"], num_res=sum(self._lengths))
       self.opt["weights"].update({"plddt":0.1, "con":0.0, "i_con":1.0, "i_pae":0.0})
 
+    # target MSA support (real evolutionary info for the target, instead of a
+    # single broadcast copy) -- used to recover signal lost when rm_target=True
+    # removes the structural template. decoupled from num_seq/self._num, which
+    # instead controls how many *independent binder designs* get batched
+    # together (see shared/model.py:set_seq) -- conflating the two would
+    # silently turn a single binder design into N independently-randomized ones
+    self._args["use_target_msa"] = target_msa is not None
+    num_seq = msa_depth if target_msa is not None else 1
+    if target_msa is not None:
+      assert self._num == 1, (
+        f"target_msa requires num_seq=1 (a single binder design), got "
+        f"num_seq={self._num}. num_seq batches independent binder designs "
+        f"and is unrelated to target MSA depth -- use msa_depth instead.")
+      query_aatype = self._pdb["batch"]["aatype"][:self._target_len]
+      if target_msa == "auto":
+        assert "," not in target_chain, (
+          "target_msa=\"auto\" only supports a single-chain target (no MSA "
+          "pairing across chains) -- generate a paired a3m yourself via "
+          "ColabFold for multi-chain targets and pass its path as target_msa.")
+        query_seq = "".join(residue_constants.restypes[a] if a < 20 else "X"
+                             for a in query_aatype.tolist())
+        target_msa = fetch_msa(query_seq, mode=target_msa_mode)
+      msa_aatype = prep_msa(target_msa, num_seq=num_seq, query_aatype=query_aatype)
+
     # configure input features
-    self._inputs = self._prep_features(num_res=sum(self._lengths), num_seq=1)
+    self._inputs = self._prep_features(num_res=sum(self._lengths), num_seq=num_seq)
     self._inputs["residue_index"] = res_idx
     self._inputs["batch"] = self._pdb["batch"]
+    if target_msa is not None:
+      self._inputs["batch"]["msa_aatype"] = msa_aatype
     self._inputs.update(get_multi_id(self._lengths))
 
     # configure template rm masks
@@ -388,6 +431,127 @@ def repeat_idx(idx, copies=1, offset=50):
 
 def repeat_pos(pos, copies, length):
   return (np.repeat(pos,copies).reshape(-1,copies) + np.arange(copies) * length).T.flatten()
+
+def _align_cols(a, b):
+  '''
+  align sequence [a] (e.g. the resolved/target sequence) onto sequence [b]
+  (e.g. an a3m's own query row, usually the full expressed sequence).
+  returns a list of length len(a): for each position in a, the matching
+  index into b, or None if no match was found (e.g. missing density in a
+  that isn't simply an unaligned insertion in b).
+  '''
+  import difflib
+  sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+  cols = [None] * len(a)
+  for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    if tag in ("equal", "replace"):
+      n = min(i2 - i1, j2 - j1)
+      for k in range(n):
+        cols[i1 + k] = j1 + k
+  return cols
+
+def prep_msa(a3m, num_seq, query_aatype=None):
+  '''
+  parse an a3m alignment (file path or raw string) into an aatype array
+  of shape (num_seq, L), for use as the "target_msa" input of _prep_binder.
+  -query_aatype - if given, the alignment is mapped onto this exact target
+                  sequence (so the row AlphaFold treats as the query always
+                  matches what's used elsewhere in prep). If the a3m's own
+                  query row differs in length (e.g. it was built from the
+                  full expressed antibody sequence, while ignore_missing
+                  dropped some unresolved loop residues from the structure),
+                  columns are aligned by sequence and any target residue
+                  that can't be aligned is gap-filled (no MSA info there).
+  '''
+  import os
+  a3m_string = open(a3m).read() if os.path.isfile(a3m) else a3m
+  # strip ColabFold's paired-MSA cardinality header ("#len1,len2\t1,1"), which
+  # parse_a3m (a plain a3m parser) doesn't expect
+  a3m_string = "\n".join(l for l in a3m_string.splitlines() if not l.startswith("#"))
+  seqs, _ = parsers.parse_a3m(a3m_string)
+
+  aa_to_id = residue_constants.HHBLITS_AA_TO_ID
+  mapping = residue_constants.MAP_HHBLITS_AATYPE_TO_OUR_AATYPE
+  msa = np.array([[mapping[aa_to_id.get(a.upper(),20)] for a in s] for s in seqs])
+
+  if query_aatype is not None:
+    query_aatype = np.asarray(query_aatype)
+    target_seq = "".join(residue_constants.restypes[a] if a < 20 else "X"
+                          for a in query_aatype.tolist())
+    if msa.shape[1] != len(target_seq) or seqs[0] != target_seq:
+      cols = _align_cols(target_seq, seqs[0])
+      n_missing = cols.count(None)
+      if n_missing > 0:
+        print(f"NOTE: {n_missing}/{len(cols)} target residues could not be "
+              f"aligned to the target_msa and will have no MSA information "
+              f"(gap-filled) -- this is expected if those residues have "
+              f"missing density in the input structure.")
+      new_msa = np.full((msa.shape[0], len(cols)), 21, dtype=msa.dtype)
+      for i, c in enumerate(cols):
+        if c is not None:
+          new_msa[:, i] = msa[:, c]
+      msa = new_msa
+    msa[0] = query_aatype
+
+  # select/pad to the requested number of rows (query row always kept)
+  n = msa.shape[0]
+  if n >= num_seq:
+    msa = msa[:num_seq]
+  else:
+    pad = np.full((num_seq - n, msa.shape[1]), 21, dtype=msa.dtype) # pad with gap
+    msa = np.concatenate([msa, pad], 0)
+  return msa
+
+def fetch_msa(sequence, mode="env", host_url="https://api.colabfold.com",
+              user_agent="colabdesign"):
+  '''
+  fetch an a3m alignment for a single-chain [sequence] from the public
+  ColabFold MMseqs2 API -- the same server ColabFold's own notebooks use
+  to build MSAs. Returns the a3m contents as a string.
+  -mode = "env" (MGnify+ColabFoldDB, matches ColabFold's default) or
+          "all" (+ UniRef, slower/deeper)
+  Note: this only searches a single sequence. For multi-chain/paired
+  complexes (e.g. an antibody Fab), pairing needs ColabFold's own
+  search pipeline (colabfold_search / the ColabFold notebook) -- generate
+  the a3m there and pass its path as target_msa instead.
+  '''
+  import json, tarfile, io, time
+  import urllib.request, urllib.parse
+
+  headers = {"User-Agent": user_agent}
+
+  def _request(url, data=None):
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+      return r.read()
+
+  query = f">query\n{sequence}\n"
+  data = urllib.parse.urlencode({"q":query, "mode":mode}).encode()
+  res = json.loads(_request(f"{host_url}/ticket/msa", data=data))
+  ticket_id = res["id"]
+
+  status = res.get("status","")
+  while status not in ("COMPLETE","ERROR"):
+    time.sleep(5)
+    res = json.loads(_request(f"{host_url}/ticket/{ticket_id}"))
+    status = res.get("status","")
+
+  if status == "ERROR":
+    raise RuntimeError(
+      "the ColabFold MMseqs2 API returned an error while computing the MSA "
+      "-- try again later, or generate the a3m yourself via ColabFold.")
+
+  tar_bytes = _request(f"{host_url}/result/download/{ticket_id}")
+  a3m_lines = []
+  with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
+    for name in sorted(tar.getnames()):
+      if name.endswith(".a3m"):
+        f = tar.extractfile(name)
+        if f is not None:
+          a3m_lines.append(f.read().decode())
+  if len(a3m_lines) == 0:
+    raise RuntimeError("no .a3m file found in the MMseqs2 API result")
+  return "\n".join(a3m_lines)
 
 def prep_pdb(pdb_filename, chain=None,
              offsets=None, lengths=None,
