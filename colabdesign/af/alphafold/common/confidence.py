@@ -111,7 +111,7 @@ def compute_predicted_aligned_error(logits, breaks, use_jnp=False):
   }
 
 def predicted_tm_score(logits, breaks, residue_weights = None,
-    asym_id = None, use_jnp=False):
+    asym_id = None, pair_mask = None, use_jnp=False):
   """Computes predicted TM alignment or predicted interface TM alignment score.
 
   Args:
@@ -155,10 +155,11 @@ def predicted_tm_score(logits, breaks, residue_weights = None,
   # E_distances tm(distance).
   predicted_tm_term = (probs * tm_per_bin).sum(-1)
 
-  if asym_id is None:
-    pair_mask = _np.full((num_res,num_res),True)
-  else:
-    pair_mask = asym_id[:, None] != asym_id[None, :]
+  if pair_mask is None:
+    if asym_id is None:
+      pair_mask = _np.full((num_res,num_res),True)
+    else:
+      pair_mask = asym_id[:, None] != asym_id[None, :]
 
   predicted_tm_term *= pair_mask
 

@@ -211,7 +211,45 @@ def get_ptm(inputs, outputs, interface=False):
     if "asym_id" in pae:
       pae.pop("asym_id")
   return confidence.predicted_tm_score(**pae, use_jnp=True)
-  
+
+def get_binder_i_ptm(inputs, outputs, cutoff=None):
+  '''
+  i_ptm restricted to the binder<->target interface.
+  ---------------------------------------------------
+  get_ptm(interface=True) scores EVERY inter-chain pair, which for a
+  multi-chain target (e.g. an antibody's light+heavy chains) includes the
+  target's own internal interfaces. Those are fixed and usually large, so
+  they dominate the score and dilute the part you actually care about.
+  This masks the pTM pair matrix to binder<->target pairs only.
+  -cutoff = if set (in Angstrom), only count target residues whose predicted
+            pseudo-CB lies within [cutoff] of any binder pseudo-CB, i.e. score
+            only the target residues actually at the interface. The selection
+            is treated as a hard mask (no gradient through the cutoff itself).
+  ---------------------------------------------------
+  '''
+  binder = inputs["binder_mask"].astype(bool)
+  # True only for pairs that straddle the binder/target boundary
+  pair_mask = binder[:,None] != binder[None,:]
+
+  if cutoff is not None:
+    cb, cb_mask = model.modules.pseudo_beta_fn(
+      inputs["aatype"],
+      outputs["structure_module"]["final_atom_positions"],
+      outputs["structure_module"]["final_atom_mask"])
+    d = jnp.sqrt(jnp.square(cb[:,None] - cb[None,:]).sum(-1) + 1e-8)
+    # distance from each residue to its nearest binder residue
+    valid = jnp.logical_and(binder[None,:], cb_mask[None,:].astype(bool))
+    d_to_binder = jnp.where(valid, d, jnp.inf).min(-1)
+    keep = jnp.logical_or(binder, d_to_binder < cutoff)
+    keep = jax.lax.stop_gradient(keep)
+    pair_mask = jnp.logical_and(pair_mask, keep[:,None] & keep[None,:])
+
+  return confidence.predicted_tm_score(
+    residue_weights=inputs["seq_mask"],
+    pair_mask=pair_mask,
+    **outputs["predicted_aligned_error"], use_jnp=True)
+
+
 def get_dgram_bins(outputs):
   dgram = outputs["distogram"]["logits"]
   if dgram.shape[-1] == 64:

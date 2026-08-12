@@ -262,6 +262,9 @@ class _af_prep:
     # instead controls how many *independent binder designs* get batched
     # together (see shared/model.py:set_seq) -- conflating the two would
     # silently turn a single binder design into N independently-randomized ones
+    # treat "" / False / None all as "no target MSA", so callers (e.g. BindCraft
+    # settings json) can disable it with an empty string
+    if not target_msa: target_msa = None
     self._args["use_target_msa"] = target_msa is not None
     num_seq = msa_depth if target_msa is not None else 1
     if target_msa is not None:
@@ -286,7 +289,25 @@ class _af_prep:
     self._inputs["batch"] = self._pdb["batch"]
     if target_msa is not None:
       self._inputs["batch"]["msa_aatype"] = msa_aatype
-    self._inputs.update(get_multi_id(self._lengths))
+
+    # asym_id/entity_id must describe the TRUE chain composition. AF2-multimer
+    # decides same-chain vs different-chain purely from asym_id (see the
+    # relative position encoding in modules_multimer) -- the +50 residue_index
+    # gap between chains gets clipped at max_relative_idx and reads as "same
+    # chain, far apart". Passing self._lengths here would collapse a
+    # multi-chain target (e.g. an antibody's light+heavy chains) into one
+    # asym_id, so any inter-chain covariation in the MSA is reinterpreted as
+    # intra-chain restraints at nonsense sequence separations. With a template
+    # pinning the target that is survivable; with rm_target=True + a real
+    # paired MSA it tears the target apart.
+    # NOTE: self._lengths deliberately stays [target_len, binder_len] --
+    # _loss_binder builds its masks from _target_len/_binder_len rather than
+    # asym_id, so con/i_con/i_pae semantics are unchanged.
+    chain_lengths = list(self._pdb["lengths"])
+    if not redesign: chain_lengths = chain_lengths + [self._binder_len]
+    self._inputs.update(get_multi_id(chain_lengths))
+    # keep a binder mask around for interface metrics (see get_ptm)
+    self._inputs["binder_mask"] = np.arange(sum(self._lengths)) >= self._target_len
 
     # configure template rm masks
     (T,L,rm) = (self._lengths[0],sum(self._lengths),{})
@@ -472,6 +493,11 @@ def prep_msa(a3m, num_seq, query_aatype=None):
   seqs, _ = parsers.parse_a3m(a3m_string)
 
   source = a3m if is_file else "<raw a3m string>"
+  if len(seqs) == 0 or len(seqs[0]) == 0:
+    raise ValueError(
+      f"no sequences could be parsed from target_msa ({source}). Expected an "
+      f"a3m alignment whose first entry is the target/query sequence. To run "
+      f"without a target MSA, pass target_msa=None (or \"\").")
   n_use = min(num_seq, len(seqs))
   print(f"INFO: loaded target MSA from {source} -- {len(seqs)} sequences found, "
         f"{len(seqs[0])} columns, using {n_use}/{num_seq} requested rows"
