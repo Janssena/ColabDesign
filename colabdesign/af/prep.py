@@ -464,11 +464,18 @@ def prep_msa(a3m, num_seq, query_aatype=None):
                   that can't be aligned is gap-filled (no MSA info there).
   '''
   import os
-  a3m_string = open(a3m).read() if os.path.isfile(a3m) else a3m
+  is_file = os.path.isfile(a3m)
+  a3m_string = open(a3m).read() if is_file else a3m
   # strip ColabFold's paired-MSA cardinality header ("#len1,len2\t1,1"), which
   # parse_a3m (a plain a3m parser) doesn't expect
   a3m_string = "\n".join(l for l in a3m_string.splitlines() if not l.startswith("#"))
   seqs, _ = parsers.parse_a3m(a3m_string)
+
+  source = a3m if is_file else "<raw a3m string>"
+  n_use = min(num_seq, len(seqs))
+  print(f"INFO: loaded target MSA from {source} -- {len(seqs)} sequences found, "
+        f"{len(seqs[0])} columns, using {n_use}/{num_seq} requested rows"
+        + ("" if n_use == num_seq else f" ({num_seq - n_use} gap-padded rows added)"))
 
   aa_to_id = residue_constants.HHBLITS_AA_TO_ID
   mapping = residue_constants.MAP_HHBLITS_AATYPE_TO_OUR_AATYPE
