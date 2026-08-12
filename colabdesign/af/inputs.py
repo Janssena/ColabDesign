@@ -26,8 +26,22 @@ class _af_inputs:
       if self._args.get("use_target_msa", False):
         # use real target MSA (parsed from an a3m) instead of a single broadcast
         # copy, so the target side keeps evolutionary/co-variation signal even
-        # when rm_target=True removes the structural template
-        seq_target = jax.nn.one_hot(inputs["batch"]["msa_aatype"], self._args["alphabet_size"])
+        # when rm_target=True removes the structural template.
+        # NOTE: a real alignment contains gaps, so the target rows must be
+        # one-hot encoded over 22 classes to match the channel layout that
+        # msa_feat[...,0:22] expects (0-19 = aa, 20 = X, 21 = gap). Encoding
+        # them over only alphabet_size=20 would collapse every gap to an
+        # all-zero vector, i.e. "no residue at all" on a row that msa_mask
+        # still marks as valid -- which feeds the evoformer garbage.
+        seq_target = jax.nn.one_hot(inputs["batch"]["msa_aatype"], 22)
+        # AF2's msa_cluster_profile is a per-position distribution over the
+        # whole alignment and is identical in every row -- not each row's own
+        # one-hot (which is what update_seq writes for the degenerate
+        # single-sequence case). Stash the real profile for update_seq to use.
+        inputs["target_msa_profile"] = seq_target.mean(0)
+        # pad the binder design out to the same 22 channels so the concat lines up
+        pad = 22 - self._args["alphabet_size"]
+        seq = jax.tree_util.tree_map(lambda x:jnp.pad(x,[[0,0],[0,0],[0,pad]]), seq)
       else:
         seq_target = jax.nn.one_hot(inputs["batch"]["aatype"][:self._target_len],self._args["alphabet_size"])
         seq_target = jnp.broadcast_to(seq_target,(self._num, *seq_target.shape))
@@ -124,6 +138,14 @@ def update_seq(seq, inputs, seq_1hot=None, seq_pssm=None, mlm=None):
   seq_1hot = jnp.pad(seq_1hot,[[0,0],[0,0],[0,22-seq_1hot.shape[-1]]])
   seq_pssm = jnp.pad(seq_pssm,[[0,0],[0,0],[0,22-seq_pssm.shape[-1]]])
   msa_feat = jnp.zeros_like(inputs["msa_feat"]).at[...,0:22].set(seq_1hot).at[...,25:47].set(seq_pssm)
+
+  # when a real target MSA is used, the profile channels over the target must
+  # hold the alignment-wide per-position distribution (same in every row),
+  # not each row's own one-hot
+  if "target_msa_profile" in inputs:
+    p = inputs["target_msa_profile"]
+    T = p.shape[0]
+    msa_feat = msa_feat.at[:,:T,25:47].set(jnp.broadcast_to(p,(msa_feat.shape[0],T,22)))
 
   # masked language modeling (randomly mask positions)
   if mlm is not None:    
